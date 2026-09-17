@@ -10,26 +10,24 @@
 #include <unordered_map>
 #include <vector>
 
-#include <torch/csrc/stable/device.h>
-#include <torch/csrc/stable/tensor.h>
-#include <torch/headeronly/core/ScalarType.h>
-
 #include "constants.hpp"
 #include "ftensor.hpp"
 #include "page.hpp"
+#include "torch_utils.hpp"
 
 namespace kvcached {
 
 class KVCACHED_HIDDEN FTensorAllocator {
 public:
-  FTensorAllocator(const torch::stable::Device &device, bool contiguous_layout);
+  FTensorAllocator(const kv_device_t &device, bool contiguous_layout);
   ~FTensorAllocator();
 
   // KV cache interfaces.
-  std::vector<torch::stable::Tensor>
-  create_kv_tensors(size_t size, torch::headeronly::ScalarType dtype,
-                    const std::string &dev_str, int64_t num_layers,
-                    int64_t num_kv_buffers = 2, bool unified_pool = false);
+  std::vector<kv_tensor_t> create_kv_tensors(size_t size, kv_scalar_t dtype,
+                                             const std::string &dev_str,
+                                             int64_t num_layers,
+                                             int64_t num_kv_buffers = 2,
+                                             bool unified_pool = false);
   bool kv_tensors_created();
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
@@ -47,19 +45,17 @@ public:
 private:
   // Raw FTensor interfaces. Must call with lock.
   static std::string get_anon_tensor_name_();
-  std::vector<torch::stable::Tensor>
+  std::vector<kv_tensor_t>
   create_kv_tensors_per_layer_(std::string_view prefix, size_t size,
-                               torch::headeronly::ScalarType dtype,
-                               const std::string &dev_str, int64_t num_layers);
-  std::vector<torch::stable::Tensor>
-  create_kv_tensors_contiguous_(size_t size,
-                                torch::headeronly::ScalarType dtype,
+                               kv_scalar_t dtype, const std::string &dev_str,
+                               int64_t num_layers);
+  std::vector<kv_tensor_t>
+  create_kv_tensors_contiguous_(size_t size, kv_scalar_t dtype,
                                 const std::string &dev_str, int64_t num_layers,
                                 size_t compound_page_size);
-  torch::stable::Tensor create_ftensor_(size_t size,
-                                        torch::headeronly::ScalarType dtype,
-                                        const std::string &dev_str,
-                                        std::string name = "");
+  kv_tensor_t create_ftensor_(size_t size, kv_scalar_t dtype,
+                              const std::string &dev_str,
+                              std::string name = "");
 
   // GPU VMM util functions.
   void init_gpu_();
@@ -69,10 +65,10 @@ private:
       g_allocators_;
   static std::mutex g_allocator_mutex_;
   // Device and layout from init(), used to create new group allocators.
-  static torch::stable::Device g_device_;
+  static kv_device_t g_device_;
   static bool g_contiguous_layout_;
 
-  torch::stable::Device dev_;
+  kv_device_t dev_;
 
   int64_t num_layers_;
   bool contiguous_layout_;

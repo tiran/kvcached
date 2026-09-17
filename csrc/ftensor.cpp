@@ -6,7 +6,11 @@
 #include <sys/mman.h>
 #include <vector>
 
+#ifdef TORCH_TARGET_VERSION
 #include <torch/csrc/stable/ops.h>
+#else
+#include <ATen/ops/from_blob.h>
+#endif
 
 #include "constants.hpp"
 #include "ftensor.hpp"
@@ -18,14 +22,14 @@ namespace kvcached {
 
 static std::atomic<size_t> g_vaddr_allocated_offset = 0;
 
-static inline int resolve_device_index(const torch::stable::Device &dev) {
+static inline int resolve_device_index(const kv_device_t &dev) {
   if (dev.index() >= 0) {
     return dev.index();
   }
   return gpu_vmm::current_device();
 }
 
-static inline generic_ptr_t alloc_virtual_mem(const torch::stable::Device &dev,
+static inline generic_ptr_t alloc_virtual_mem(const kv_device_t &dev,
                                               size_t size) {
   size_t alignment_2mb = 2 * 1024 * 1024;
   ASSERT(size % alignment_2mb == 0,
@@ -48,9 +52,9 @@ static inline generic_ptr_t alloc_virtual_mem(const torch::stable::Device &dev,
   return vaddr;
 }
 
-static inline std::unique_ptr<Page>
-make_unique_page(const torch::stable::Device &dev, page_id_t page_id,
-                 size_t page_size = 0) {
+static inline std::unique_ptr<Page> make_unique_page(const kv_device_t &dev,
+                                                     page_id_t page_id,
+                                                     size_t page_size = 0) {
   if (dev.is_cuda()) {
     return std::make_unique<GPUPage>(page_id, resolve_device_index(dev),
                                      page_size);
@@ -61,9 +65,9 @@ make_unique_page(const torch::stable::Device &dev, page_id_t page_id,
   return nullptr;
 }
 
-FTensor::FTensor(const std::string &name, size_t size,
-                 torch::headeronly::ScalarType dtype, torch::stable::Device dev,
-                 std::shared_ptr<Page> zero_page, size_t page_size)
+FTensor::FTensor(const std::string &name, size_t size, kv_scalar_t dtype,
+                 kv_device_t dev, std::shared_ptr<Page> zero_page,
+                 size_t page_size)
     : name_(name), vaddr_(nullptr), size_(size),
       page_size_(page_size > 0 ? page_size : kPageSize), dtype_(dtype),
       dev_(dev), zero_page_(zero_page) {
@@ -71,10 +75,17 @@ FTensor::FTensor(const std::string &name, size_t size,
   init_with_zero_();
 
   auto num_elems = static_cast<int64_t>(size / element_size(dtype_));
+#ifdef TORCH_TARGET_VERSION
   std::vector<int64_t> sizes = {num_elems};
   std::vector<int64_t> strides = {1};
   tensor_ = torch::stable::from_blob(reinterpret_cast<void *>(vaddr_), sizes,
                                      strides, dev_, dtype_);
+#else
+  auto options =
+      at::TensorOptions().dtype(dtype_).device(dev_).requires_grad(false);
+  tensor_ =
+      at::from_blob(reinterpret_cast<void *>(vaddr_), {num_elems}, options);
+#endif
 }
 
 FTensor::~FTensor() {

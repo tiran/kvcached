@@ -7,16 +7,39 @@
 #include <stdexcept>
 #include <string>
 
+// Compatibility hub for the two tensor backends: stable ABI when
+// TORCH_TARGET_VERSION is defined (Torch >= 2.13, set by setup.py), classic
+// ATen/c10 otherwise. Downstream code refers only to the kv_* aliases.
+// TODO(drop @ torch>=2.13): drop the classic branch and make the stable path
+// unconditional (applies to every #ifdef TORCH_TARGET_VERSION in csrc).
+#ifdef TORCH_TARGET_VERSION
+#include <torch/csrc/stable/device.h>
+#include <torch/csrc/stable/tensor.h>
 #include <torch/headeronly/core/ScalarType.h>
+#else
+#include <ATen/core/Tensor.h>
+#include <c10/core/Device.h>
+#include <c10/core/ScalarType.h>
+#endif
 
 namespace kvcached {
 
-// Map a raw element size (in bytes) to a stable-ABI ScalarType. kvcached only
-// cares about the element width, not the semantic type, so any integer type of
-// the right size works.
-static inline torch::headeronly::ScalarType
-torch_dtype_from_size(size_t dtype_size) {
-  using ST = torch::headeronly::ScalarType;
+#ifdef TORCH_TARGET_VERSION
+using kv_tensor_t = torch::stable::Tensor;
+using kv_device_t = torch::stable::Device;
+using kv_scalar_t = torch::headeronly::ScalarType;
+inline constexpr auto kv_device_type_cpu = torch::headeronly::kCPU;
+#else
+using kv_tensor_t = at::Tensor;
+using kv_device_t = c10::Device;
+using kv_scalar_t = c10::ScalarType;
+inline constexpr auto kv_device_type_cpu = c10::kCPU;
+#endif
+
+// Map a raw element size to a ScalarType. Only the width matters, so any type
+// of the right size works; the enumerators are shared by both backends.
+static inline kv_scalar_t torch_dtype_from_size(size_t dtype_size) {
+  using ST = kv_scalar_t;
   switch (dtype_size) {
   case 1:
     return ST::Char;
@@ -32,11 +55,11 @@ torch_dtype_from_size(size_t dtype_size) {
   }
 }
 
-// Element size of a stable-ABI ScalarType. The stable Tensor exposes
-// element_size(), but FTensor needs the size of a bare ScalarType (before any
-// tensor exists), which the stable ABI does not provide as a free function.
-static inline size_t element_size(torch::headeronly::ScalarType dtype) {
-  using ST = torch::headeronly::ScalarType;
+// Element size of a bare ScalarType, needed before any tensor exists (to size
+// the mapping). The stable ABI has no free function for it, so compute
+// directly.
+static inline size_t element_size(kv_scalar_t dtype) {
+  using ST = kv_scalar_t;
   switch (dtype) {
   case ST::Byte:
   case ST::Char:

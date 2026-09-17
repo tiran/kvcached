@@ -22,7 +22,7 @@ try:
         library_paths,
     )
 except ImportError:
-    raise ImportError("Torch not found, please install torch>=2.10.0 first.")
+    raise ImportError("Torch not found, please install torch first.")
 
 SCRIPT_PATH = os.path.dirname(os.path.realpath(__file__))
 ROOT_PATH = SCRIPT_PATH
@@ -40,13 +40,31 @@ def get_csrc_files(path) -> List[str]:
     return cpp_files
 
 
-# Minimum PyTorch version whose stable ABI the KV tensor ops target (registered
-# via STABLE_TORCH_LIBRARY in csrc/torch_bindings.cpp).
-ABI_VERSION = (2, 10)
-TORCH_TARGET_VERSION = f"0x{(ABI_VERSION[0] << 56) | (ABI_VERSION[1] << 48):016x}"
+# Torch's pybind11 headers only compile against the stable ABI from 2.13 on;
+# below that we build the classic path.
+# TODO(drop @ torch>=2.13): drop this constant and the classic build path;
+# the stable path becomes unconditional.
+STABLE_ABI_BUILD_MIN = (2, 13)
+# Oldest runtime the stable build stays loadable on. The stable APIs we use are
+# all available since 2.10.
+STABLE_ABI_TARGET = (2, 10)
+
+
+def torch_version() -> tuple:
+    base = torch.__version__.split("+", 1)[0]
+    major, minor = (int(part) for part in base.split(".")[:2])
+    return (major, minor)
+
+
+def encode_target_version(version: tuple) -> str:
+    # One byte per component, major in the most-significant byte.
+    major, minor = version
+    return f"0x{(major << 56) | (minor << 48):016x}"
 
 
 def get_extensions():
+    use_stable_abi = torch_version() >= STABLE_ABI_BUILD_MIN
+
     csrc_files = get_csrc_files(CSRC_PATH)
 
     # Get the C++ ABI flag from PyTorch
@@ -70,8 +88,13 @@ def get_extensions():
         "-std=c++17",
         f"-D_GLIBCXX_USE_CXX11_ABI={int(cxx_abi)}",
         backend_define,
-        f"-DTORCH_TARGET_VERSION={TORCH_TARGET_VERSION}",
     ]
+    if use_stable_abi:
+        # Targets the stable ABI and selects the stable path in csrc (the
+        # #ifdefs key on TORCH_TARGET_VERSION).
+        extra_compile_args.append(
+            f"-DTORCH_TARGET_VERSION={encode_target_version(STABLE_ABI_TARGET)}"
+        )
 
     ext_include_dirs = include_paths(device_type="cuda") + [
         os.path.join(CSRC_PATH, "inc")
@@ -109,7 +132,8 @@ def get_extensions():
                 "nvcc": extra_compile_args,
             },
         )
-    print(f"Building kvcached._C with backend: {backend_name}")
+    abi = "stable ABI" if use_stable_abi else "classic ABI"
+    print(f"Building kvcached._C with backend: {backend_name} ({abi})")
     return [ext_module], {"build_ext": BuildExtension}
 
 

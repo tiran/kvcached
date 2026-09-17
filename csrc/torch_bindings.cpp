@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the kvcached project
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdint>
 #include <memory>
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
@@ -8,8 +9,22 @@
 #include <string>
 #include <vector>
 
+#ifdef TORCH_TARGET_VERSION
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/tensor.h>
+
+// Fail if the target is newer than the libtorch headers (else the binary
+// silently needs absent symbols).
+// TODO(drop @ torch>=2.15): PyTorch ships this guard (pytorch/pytorch#193962).
+#if TORCH_TARGET_VERSION > TORCH_ABI_VERSION
+#error "TORCH_TARGET_VERSION is newer than the libtorch headers this build "       \
+    "compiles against. Lower it to <= TORCH_ABI_VERSION "                       \
+    "(torch/headeronly/version.h) or build against a newer PyTorch."
+#endif
+#else
+// Classic path: the at::Tensor <-> Python type caster for the pybind ops below.
+#include <torch/csrc/utils/pybind.h>
+#endif
 
 #include "allocator.hpp"
 #include "constants.hpp"
@@ -21,29 +36,39 @@ namespace py = pybind11;
 namespace kvcached {
 
 // ---------------------------------------------------------------------------
-// KV tensor ops.
+// KV tensor ops -- the only bindings that touch the tensor type.
 //
-// These are the only bindings that touch torch::Tensor, so they are registered
-// through the PyTorch stable ABI (STABLE_TORCH_LIBRARY) instead of pybind11.
-// This decouples them from libtorch's unstable C++ ABI. They are reached from
-// Python via torch.ops.kvcached.* (re-exported by kvcached/vmm_ops.py).
+// Stable build: registered via STABLE_TORCH_LIBRARY, reached as
+// torch.ops.kvcached.*. Classic build: pybind functions on the module, reached
+// as kvcached._C.*. vmm_ops.py hides the difference.
 //
-// The dispatcher schema uses int64_t/bool/str/int[]/Tensor[]; sizes that are
-// logically size_t are passed as int64_t and cast at the boundary.
+// size_t values cross the boundary as int64_t. Only the classic path holds the
+// GIL, so it is released around the blocking allocator work (issue #371).
 // ---------------------------------------------------------------------------
+
+#ifdef TORCH_TARGET_VERSION
+#define KVCACHED_RELEASE_GIL() ((void)0)
+#else
+#define KVCACHED_RELEASE_GIL() py::gil_scoped_release release
+#endif
 
 void init_kvcached(std::string dev_str, int64_t page_size,
                    bool contiguous_layout) {
+  KVCACHED_RELEASE_GIL();
   FTensorAllocator::init(dev_str, static_cast<size_t>(page_size),
                          contiguous_layout);
 }
 
-void shutdown_kvcached() { FTensorAllocator::shutdown(); }
+void shutdown_kvcached() {
+  KVCACHED_RELEASE_GIL();
+  FTensorAllocator::shutdown();
+}
 
-std::vector<torch::stable::Tensor>
+std::vector<kv_tensor_t>
 create_kv_tensors(int64_t size, int64_t dtype_size, std::string dev_str,
                   int64_t num_layers, int64_t num_kv_buffers, int64_t group_id,
                   bool unified_pool) {
+  KVCACHED_RELEASE_GIL();
   auto allocator = FTensorAllocator::global_allocator(group_id);
   auto dtype_ = torch_dtype_from_size(static_cast<size_t>(dtype_size));
   return allocator->create_kv_tensors(static_cast<size_t>(size), dtype_,
@@ -52,26 +77,26 @@ create_kv_tensors(int64_t size, int64_t dtype_size, std::string dev_str,
 }
 
 bool kv_tensors_created(int64_t group_id) {
+  KVCACHED_RELEASE_GIL();
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->kv_tensors_created();
 }
 
 bool map_to_kv_tensors(std::vector<int64_t> offsets, int64_t group_id) {
+  KVCACHED_RELEASE_GIL();
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->map_to_kv_tensors(offsets);
 }
 
 bool unmap_from_kv_tensors(std::vector<int64_t> offsets, int64_t group_id) {
+  KVCACHED_RELEASE_GIL();
   auto allocator = FTensorAllocator::global_allocator(group_id);
   return allocator->unmap_from_kv_tensors(offsets);
 }
 
 // ---------------------------------------------------------------------------
-// PageAllocator / InternalPage bindings.
-//
-// These classes contain no torch types (only ints, vectors, dicts, callbacks),
-// so they do not couple to libtorch's C++ ABI and stay on pybind11, which keeps
-// their class-based API, Python callbacks, and dict returns intact.
+// PageAllocator / InternalPage bindings -- no torch types, so they stay on
+// pybind11 regardless of the ABI path.
 // ---------------------------------------------------------------------------
 
 std::shared_ptr<PageAllocator> create_page_allocator(
@@ -207,6 +232,7 @@ page_allocator_group_indices_by_page(std::shared_ptr<PageAllocator> allocator,
 
 } // namespace kvcached
 
+#ifdef TORCH_TARGET_VERSION
 // Register the KV tensor ops in the "kvcached" dispatcher namespace.
 STABLE_TORCH_LIBRARY(kvcached, m) {
   m.def("init_kvcached(str dev_str, int page_size=0, bool "
@@ -228,13 +254,40 @@ STABLE_TORCH_LIBRARY_IMPL(kvcached, CompositeExplicitAutograd, m) {
   m.impl("map_to_kv_tensors", TORCH_BOX(&kvcached::map_to_kv_tensors));
   m.impl("unmap_from_kv_tensors", TORCH_BOX(&kvcached::unmap_from_kv_tensors));
 }
+#endif // TORCH_TARGET_VERSION
 
-// The pybind11 module hosts only the torch-free PageAllocator / InternalPage
-// classes. TORCH_EXTENSION_NAME resolves to the compiled extension name (_C);
-// importing it also runs the STABLE_TORCH_LIBRARY static initializers above,
-// registering the KV tensor ops.
+// Always hosts the torch-free PageAllocator / InternalPage classes; the classic
+// build also registers the KV tensor ops here (the stable build uses the
+// dispatcher above).
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "kvcached VMM plugin";
+
+  // Stable-ABI target, or None on a classic build; the ABI path _C uses (see
+  // vmm_ops.py).
+#ifdef TORCH_TARGET_VERSION
+  m.attr("TORCH_TARGET_VERSION") =
+      py::int_(static_cast<uint64_t>(TORCH_TARGET_VERSION));
+#else
+  m.attr("TORCH_TARGET_VERSION") = py::none();
+#endif
+
+#ifndef TORCH_TARGET_VERSION
+  // KV tensor ops (classic path); the stable path uses the dispatcher above.
+  m.def("init_kvcached", &kvcached::init_kvcached, "Initialize kvcached",
+        py::arg("dev_str"), py::arg("page_size") = 0,
+        py::arg("contiguous_layout") = true);
+  m.def("shutdown_kvcached", &kvcached::shutdown_kvcached, "Shutdown kvcached");
+  m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors",
+        py::arg("size"), py::arg("dtype_size"), py::arg("dev_str"),
+        py::arg("num_layers"), py::arg("num_kv_buffers") = 2,
+        py::arg("group_id") = 0, py::arg("unified_pool") = false);
+  m.def("kv_tensors_created", &kvcached::kv_tensors_created,
+        "kv_tensors_created", py::arg("group_id") = 0);
+  m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors",
+        py::arg("offsets"), py::arg("group_id") = 0);
+  m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
+        "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
+#endif
 
   // PageAllocator bindings
   py::class_<kvcached::PageAllocator, std::shared_ptr<kvcached::PageAllocator>>(
